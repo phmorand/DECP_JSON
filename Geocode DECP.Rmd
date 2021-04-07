@@ -14,22 +14,217 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r imports}
+library(tidyverse)
+library(banR)
+library(jsonlite)
+library(magrittr)
+library(data.tree)
+library(geosphere)
+library(sf)
+library(cartography)
 ```
 
-## Including Plots
+# Collect the data
 
-You can also embed plots, for example:
+Two main datafiles are used: the first one is the collection of DECP (données essentielles de la commande publique, main data of public procurement). See [here](https://www.data.gouv.fr/fr/datasets/donnees-essentielles-de-la-commande-publique-fichiers-consolides/).
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+The second one is the SIRENE datafile. See [here](https://www.insee.fr/fr/information/3591226)
+```{r}
+
+#creating the data repository
+data_dir <- 'data'
+if (!dir.exists(data_dir)) {
+  dir.create(data_dir)
+}
+
+# downloading the DECP JSON file from the remote data.gouv.fr site.
+DECP_url <- "https://www.data.gouv.fr/fr/datasets/r/16962018-5c31-4296-9454-5998585496d2"
+DECP_destfile <-  str_c(data_dir, "/decp.json")
+if (!file.exists(DECP_destfile)) {
+ download.file(DECP_url, DECP_destfile)
+}
+
+# creating the dataframe
+df<-as.data.frame(fromJSON(DECP_destfile, flatten=TRUE)[['marches']])
+
+
+# downloading the SIRENE datafile 
+sirene_destfile <-  str_c(data_dir, "/etablissements-sirene.zip")
+sirene_url = "https://www.data.gouv.fr/fr/datasets/r/3966c990-d3a0-48b4-95b9-745fa24b2589"
+if (!file.exists(sirene_destfile)) {
+  download.file(sirene_url, sirene_destfile)
+  # The unzipped CSV file is more than 4GB, so R's unzip will choke on it
+  # We've got to unzip it manually
+  unzip(sirene_destfile,
+        unzip = getOption("unzip"),
+        exdir = data_dir)
+}
+
+sirene_csv <-
+  str_c(data_dir, '/', unzip(sirene_destfile, list = TRUE)[[1]])
+
+
+base_sirene <- read_csv(
+  sirene_csv,
+  col_types = cols_only(
+    siret = col_character(),
+    codePostalEtablissement = col_character(),
+    codeCedexEtablissement = col_character()
+  )
+) %>%
+  rename(sirene_code_postal=codePostalEtablissement)
+```
+# Join the databases
+
+In order to geocode the DECP, we use de SIRET number of the purchasers and the SIRET number of the selected suppliers. The first step is to add the zip-code of the purchasers.
+
+```{r}
+# Ajouter les CP aux DECP
+df<-left_join(df, base_sirene,by=c("acheteur.id"="siret"))
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+In the case of suppliers, it is necessary to proceed in step by step. Indeed, in some cases, several companies are selected on the same contract. We therefore have to flatten our database.
+
+```{r}
+# number of selected suppliers
+nb_tit<-c()
+for(i in 1:length(df$uid)){nb_tit[[i]]<-length(df$titulaires[[i]]$id)}
+df$nb_tit<-nb_tit
+
+#création de la table multi-attributaire
+k<-1
+uid<-c()
+for(i in 1:length(df$uid)){for(j in 1:ifelse(df$nb_tit[[i]]==0,1,df$nb_tit[[i]])){uid[[k]]<-df$uid[[i]]; k<-k+1}}
+tit<-c()
+k<-1
+for(i in 1:length(df$uid)){for(j in 1:ifelse(df$nb_tit[[i]]==0,1,df$nb_tit[[i]])){tit[[k]]<-df$titulaires[[i]]$id[j]; k<-k+1}}
+df2<-data.frame()
+df2<-as.data.frame(cbind(uid, tit))
+df2$tit<-as.character(df2$tit)
+df2$uid<-as.character(df2$uid)
+#associer le code postal au SIRET des titulaires
+
+df2<-left_join(df2, base_sirene,by=c("tit"="siret"),keep=TRUE)
+
+#et on regroupe tout
+
+df<-left_join(df2,df, by="uid")
+```
+
+
+# Add variables in our dataframe
+
+
+```{r}
+#creation d'une colonne "année"
+df$year <-str_sub(df$id,1,4)
+
+#création d'une colonne "département_tit"
+df$departement_tit <-str_sub(df$sirene_code_postal.x,1,2)
+
+#création d'une colonne "département_acheteur"
+df$departement_ach <-str_sub(df$sirene_code_postal.y,1,2)
+
+#creation de l'item achat local
+df$local<-ifelse(df$departement_ach==df$departement_tit,1,0)
+summary(df$local)
+
+#creation de l'item CPV à 2 digits
+df$CPV2<-str_sub(df$codeCPV,1,2)
+```
+
+Postal codes enable us to merger GPS coordinates:
+```{r}
+#import des coordonnées GPS
+# to do: the code_postaux.csv is my own file. I don't remember where it comes from. Clean and open source is needed.
+
+GPS_destfile <-  str_c(data_dir, "/code_postaux.csv")
+
+gps <- read_csv(GPS_destfile)
+
+#fusion des données pour importer coordonnées gps acheteur
+
+df<-left_join(df, gps,by=c("sirene_code_postal.y"="Code_postal"))
+
+#fusion des données pour importer coordonnées gps fournisseur
+
+df<-left_join(df, gps,by=c("sirene_code_postal.x"="Code_postal"))
+```
+
+We also use the NUTS of the suppliers and the purchasers. The Nomenclature of Territorial Units for Statistics (NUTS) was established by Eurostat in order to provide a single uniform breakdown of territorial units for the production of regional statistics for the European Union.
+
+
+```{r}
+#création de l'item NUTS_ach et NUTS_tit
+
+NUTS_destfile <-  str_c(data_dir, "/dept_nuts.csv")
+dept_nuts<-read_csv(NUTS_destfile)
+df<-left_join(df,dept_nuts, by=c("departement_tit"="0C"))
+df<-left_join(df,dept_nuts, by=c("departement_ach"="0C"))
+names(df)[names(df) == 'NUTS_3.x'] <- 'nuts_tit'
+names(df)[names(df) == 'NUTS_3.y'] <- 'nuts_ach'
+
+```
+
+
+We add geographical variables to the main dataframe:
+
+```{r}
+
+#calcul de la distance (en km)
+
+
+for(i in 1:length(df$uid)){df$distance[i]<-distGeo(c(df$coordonnees_gps1.x[i],df$coordonnees_gps2.x[i]),c(df$coordonnees_gps1.y[i],df$coordonnees_gps2.y[i]))}
+df$distance<-df$distance/1000
+
+
+
+#création de l'item NUTS à 4 et 3 caractères
+
+df$nuts4_tit<-str_sub(df$nuts_tit,1,4)
+df$nuts4_ach<-str_sub(df$nuts_ach,1,4)
+
+df$nuts3_tit<-str_sub(df$nuts_tit,1,3)
+df$nuts3_ach<-str_sub(df$nuts_ach,1,3)
+
+table(df$nuts3_ach, df$nuts3_tit)
+```
+# Creating maps
+
+```{r}
+#cartographie
+
+
+data(nuts2006)
+ls()
+
+
+
+region<-as.data.frame(table(df$nuts4_ach))
+names(region)[names(region) == 'Var1'] <- 'id'
+choroLayer(spdf = nuts2.spdf, df = region, var = "Freq")
+title("Nombre de contrats passés")
+
+# Ajout des titres, légende, sources, etc.
+layoutLayer(title = "Nombre de contrats passés par région",
+            author = "PH Morand",
+            sources = "data.gouv.fr, 2021",
+            scale = NULL,
+            south = TRUE)
+
+departement<-as.data.frame(table(df$nuts_ach))
+names(departement)[names(departement) == 'Var1'] <- 'id'
+choroLayer(spdf = nuts3.spdf, df = departement, var = "Freq")
+title("Nombre de contrats passés")
+
+# Ajout des titres, légende, sources, etc.
+layoutLayer(title = "Nombre de contrats passés par département",
+            author = "PH Morand",
+            sources = "data.gouv.fr, 2021",
+            scale = NULL,
+            south = TRUE)
+
+```
+
+
